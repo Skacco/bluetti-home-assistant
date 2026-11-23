@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, List, cast
 import async_timeout
 from bleak import BleakClient, BleakError, BleakScanner
@@ -21,6 +22,9 @@ NOTIFY_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
 DEVICE_NAME_UUID = "00002a00-0000-1000-8000-00805f9b34fb"
 # Wait after the latest notification before decoding.
 FRAGMENT_QUIET_SECONDS = 0.5
+
+# Local diagnostic patch: warn when a single step of read_data() takes longer than this
+SLOW_STEP_SECONDS = 20
 ENCRYPTION_SCAN_TIMEOUT = 10
 
 
@@ -61,6 +65,60 @@ class DeviceReaderV2:
         # first handshake packet (see read_data / _encrypt_link)
         self._handshake_armed = False
 
+        # Local diagnostic patch: current step of read_data() and when it started
+        self.debug_step = "idle"
+        self.debug_step_since = time.monotonic()
+
+    def _step(self, name: str) -> None:
+        """Local diagnostic patch: record the step read_data() is entering."""
+        now = time.monotonic()
+        elapsed = now - self.debug_step_since
+        if elapsed > SLOW_STEP_SECONDS and self.debug_step != "idle":
+            _LOGGER.warning(
+                "[diag] %s step '%s' took %.1fs (next: '%s')",
+                self.oak_device.sn if self.oak_device else "?",
+                self.debug_step,
+                elapsed,
+                name,
+            )
+        self.debug_step = name
+        self.debug_step_since = now
+
+    def debug_state(self) -> str:
+        """Local diagnostic patch: describe where read_data() currently is."""
+        return (
+            f"step='{self.debug_step}' for {time.monotonic() - self.debug_step_since:.1f}s, "
+            f"is_connected={self.client.is_connected if self.client else None}, "
+            f"has_notifier={self.has_notifier}, is_crypting={self.is_crypting}, "
+            f"enable_crypt={self.enable_crypt}, lock_locked={self.polling_lock.locked()}"
+        )
+
+    def _send_handshake(self, data: bytes, what: str) -> None:
+        """Local diagnostic patch: fire-and-forget handshake write, like the original
+        code, but log a failure instead of losing it silently."""
+        sn = self.oak_device.sn if self.oak_device else "?"
+        size = len(data)
+        started = time.monotonic()
+
+        async def _write() -> None:
+            try:
+                await self.client.write_gatt_char(WRITE_UUID, data)
+            except Exception as err:  # noqa: BLE001 - diagnostic, report everything
+                _LOGGER.warning(
+                    "[diag] %s handshake write FAILED (%s, %d bytes) after %.0f ms, connected=%s: %r",
+                    sn, what, size, (time.monotonic() - started) * 1000,
+                    self.client.is_connected if self.client else None, err,
+                )
+            else:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                if elapsed_ms > 1000:
+                    _LOGGER.warning(
+                        "[diag] %s handshake write slow (%s, %d bytes): %.0f ms",
+                        sn, what, size, elapsed_ms,
+                    )
+
+        asyncio.create_task(_write())
+
     async def is_bluetooth_connected(self) -> bool:
         if self.client:
             return self.client.is_connected
@@ -78,9 +136,11 @@ class DeviceReaderV2:
             _LOGGER.error("Device is None")
             return None
 
+        self._step("load_device_proto")
         proto_data_ok = await self.ble_decoder_module.load_device_proto()
         if proto_data_ok == False:
             _LOGGER.error(f"proto data {self.oak_device.proto_file_path} load fail!!!")
+            self._step("idle")
             return None
 
         polling_commands = self.oak_device.polling_commands
@@ -91,8 +151,10 @@ class DeviceReaderV2:
         parsed_data: dict = {}
 
         if not self.enable_crypt and not self._client_is_connected():
+            self._step("detect_encryption")
             await self._detect_encryption()
 
+        self._step("wait_polling_lock")
         async with self.polling_lock:
             try:
                 async with async_timeout.timeout(self.polling_timeout):
@@ -106,6 +168,7 @@ class DeviceReaderV2:
                                 self.has_notifier = False
                                 self._handshake_armed = False
 
+                                self._step(f"connect (attempt {attempt})")
                                 self.ble_decoder_module.start(self.enable_crypt)   # start bluetti crypt module
                                 await self.client.connect()
 
@@ -124,6 +187,7 @@ class DeviceReaderV2:
 
                     # Attach notifier if needed
                     if not self.has_notifier:
+                        self._step("start_notify")
                         # The device may send its first handshake packet as soon as
                         # notifications are enabled, before _encrypt_link() is waiting
                         # for it. Arm the future first so that packet is not dropped.
@@ -142,6 +206,7 @@ class DeviceReaderV2:
 
                     # Encrypt link if needed
                     if self.is_crypting is True:
+                        self._step("encrypt_link")
                         isSuccess = await self._encrypt_link()
                         if isSuccess == 1:
                             self.is_crypting = False
@@ -150,14 +215,17 @@ class DeviceReaderV2:
                             await self._stop_notify()
                             self.ble_decoder_module.encrypt_link_clear()
                             self.is_crypting = False
+                            self._step("idle")
                             return None
 
                         if self.is_crypting is True:
+                            self._step("idle")
                             return None
 
                     # Execute polling commands
                     for command in polling_commands:
                         try:
+                            self._step(f"polling cmd {command.fn_code}")
                             body = await self._async_send_command(command)                        
                             _LOGGER.debug(f"polling cmd:{command.fn_code} resultype:{type(body)} body:{body}")
                             if type(body) is dict:
@@ -166,22 +234,27 @@ class DeviceReaderV2:
                             _LOGGER.warning("Got a parse exception")
 
             except TimeoutError as err:
-                _LOGGER.error(f"Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                _LOGGER.error(f"Polling timed out ({self.polling_timeout}s) during step '{self.debug_step}'. Trying again later", exc_info=err)
                 await self._stop_notify()
                 self.ble_decoder_module.encrypt_link_clear()
+                self._step("idle")
                 return None
             except BleakError as err:
-                _LOGGER.error("Bleak error: %s", err)
+                _LOGGER.error("Bleak error during step '%s': %s", self.debug_step, err)
                 await self._stop_notify()
                 self.ble_decoder_module.encrypt_link_clear()
+                self._step("idle")
                 return None
             finally:
                 _LOGGER.debug(f'Read Data Ok')
             # Check if dict is empty
             if not parsed_data:
+                self._step("idle")
                 return None
 
+            self._step("parse_oak_state_data")
             bluetti_parsed_data = self.oak_device.parse_oak_state_data(parsed_data)
+            self._step("idle")
             return bluetti_parsed_data
 
     def _client_is_connected(self) -> bool:
@@ -244,6 +317,11 @@ class DeviceReaderV2:
                         # Use the future armed before start_notify: it may already
                         # hold the first handshake packet.
                         self._handshake_armed = False
+                        if self.notify_future is not None and self.notify_future.done():
+                            _LOGGER.warning(
+                                "[diag] %s first handshake packet arrived before encrypt_link started (captured, not dropped)",
+                                self.oak_device.sn if self.oak_device else "?",
+                            )
                     elif self.notify_future is None or self.notify_future.done():
                         self._arm_notify_future()
                     # Wait for response
@@ -260,9 +338,7 @@ class DeviceReaderV2:
                         read_commands = self.oak_device.read_sn_command
                         for read_sn_command in read_commands:
                             length, cmd = self.ble_decoder_module.get_read_cmd_message(read_sn_command)                        
-                            asyncio.create_task(
-                                self.client.write_gatt_char(WRITE_UUID, bytes(cmd))
-                            )
+                            self._send_handshake(bytes(cmd), f"read sn, step {retries + 1}")
                             # await self.client.write_gatt_char(
                             #     WRITE_UUID,
                             #     bytes(cmd))
@@ -272,9 +348,7 @@ class DeviceReaderV2:
                         return 1
                     elif (0 <= status and 0 < len(response)):
                         """ Pass-Through data to the bluetti encrypt module """
-                        asyncio.create_task(
-                            self.client.write_gatt_char(WRITE_UUID, bytes(response))
-                        )
+                        self._send_handshake(bytes(response), f"status {status}, step {retries + 1}")
                         # await self.client.write_gatt_char(
                         #     WRITE_UUID,
                         #     bytes(response))

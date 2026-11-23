@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 import logging
 
@@ -12,6 +13,7 @@ from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
+    UpdateFailed,
 )
 
 from homeassistant.components.bluetooth import async_discovered_service_info
@@ -21,6 +23,11 @@ from .utils.device_builder import build_device_v2
 from ..models import BluettiDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+# Local patch: extra seconds on top of polling_timeout before the whole
+# update is cancelled (covers proto load + BLE scan done outside the
+# reader's own timeout).
+WATCHDOG_MARGIN = 30
 
 def mac_loggable(mac: str) -> str:
     """Remove parts of the mac address for logging."""
@@ -138,8 +145,38 @@ class PollingCoordinator(DataUpdateCoordinator):
                 self.logger.warning(f"Device {self.bluetti_device.name}(0x{id(self)}) not connected and have no adv pack,don't update ble data")
                 return None      
 
-        data = await self.bluetti_device.read_data_from_ble()
-        return data
+        # Local patch: watchdog so a hung read can never freeze the coordinator
+        try:
+            async with asyncio.timeout(self.polling_timeout + WATCHDOG_MARGIN):
+                return await self.bluetti_device.read_data_from_ble()
+        except TimeoutError:
+            reader = self.bluetti_device.device_reader
+            state = "no reader"
+            if reader is not None:
+                try:
+                    state = reader.debug_state()
+                except Exception as e:
+                    state = f"debug_state failed: {e}"
+            self.logger.warning(
+                "[diag] BLE update for %s hung for more than %ss, resetting connection. Stuck in: %s",
+                mac_loggable(self.address),
+                self.polling_timeout + WATCHDOG_MARGIN,
+                state,
+            )
+            if reader is not None:
+                try:
+                    await reader._stop_notify()
+                    await reader.client.disconnect()
+                except Exception:
+                    pass
+                reader.has_notifier = False
+                reader.is_crypting = False
+                reader.ble_decoder_module.encrypt_link_clear()
+                try:
+                    reader._step("idle")
+                except Exception:
+                    pass
+            raise UpdateFailed("BLE update timed out")
 
     def _remember_encryption_support(self) -> None:
         """Learn the BLUETTF flag from Home Assistant's advertisement cache.
